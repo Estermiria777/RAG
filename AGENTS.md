@@ -1,0 +1,387 @@
+# Repository Guidelines
+
+## Project Overview
+
+LightRAG is a Retrieval-Augmented Generation (RAG) framework that uses graph-based knowledge representation for enhanced information retrieval. The system extracts entities and relationships from documents, builds a knowledge graph, and uses multiple retrieval modes (`local`, `global`, `hybrid`, `mix`, `naive`) for queries.
+
+## Project Structure
+
+Top-level directories:
+
+- **lightrag/**: Core Python package — see *Module Layout* below.
+- **lightrag_webui/**: React 19 + TypeScript client (Bun + Vite + Tailwind). UI components in `src/`.
+- **scripts/**: `test.sh` (preferred test runner), `setup/` interactive environment wizard (use `make env-*` rather than calling `setup.sh` directly — see *Configuration > Setup Wizard Outputs*), and release tooling.
+- **tests/**: Pytest coverage, organized into subdirectories that mirror `lightrag/` (see *Testing* below for layout). Working datasets stay in `inputs/`, `rag_storage/`, and `temp/`; deployment collateral lives in `docs/`, `k8s-deploy/`, and compose files.
+
+### Module Layout (`lightrag/`)
+
+- **lightrag.py**: Main orchestrator class (`LightRAG`) — assembled from mixins (see *LightRAG class composition*). Hosts `ainsert_custom_kg`, `_insert_done`, `_process_extract_entities`, `_refresh_addon_params_cache`, and `addon_params` accessors. Critical: always call `await rag.initialize_storages()` after instantiation.
+- **pipeline.py**: `_PipelineMixin` — owns the document ingestion pipeline (`apipeline_enqueue_documents`, `apipeline_process_enqueue_documents`, `apipeline_process_error_documents`), the `parse_native` / `parse_mineru` / `parse_docling` parser dispatchers, multimodal analysis, validation, and the worker scaffolding.
+- **utils_pipeline.py**: Pure helpers shared by the pipeline mixin and other entry points: doc-status field access, document identity (source key, content hash), parsed-artifact path resolution, parser payload normalization, multimodal entity augmentation, and `make_lightrag_doc_content`.
+- **llm_roles.py**: `RoleSpec` / `RoleLLMConfig` / `_RoleLLMState` / `ROLES` registry plus `_RoleLLMMixin` — role normalization, builder registration, wrapper rebuild, runtime config update, queue cleanup, sanitized config export, queue status reporting. Route role-specific behavior here rather than into provider modules.
+- **storage_migrations.py**: `_StorageMigrationMixin` — `check_and_migrate_data`, `_migrate_entity_relation_data`, `_migrate_chunk_tracking_storage`.
+- **addon_params.py**: `ObservableAddonParams` plus `default_addon_params` / `normalize_addon_params` helpers.
+- **operate.py**: Core extraction and query operations including entity/relation extraction, chunking, and multi-mode retrieval logic.
+- **base.py**: Abstract base classes for storage backends (`BaseKVStorage`, `BaseVectorStorage`, `BaseGraphStorage`, `BaseDocStatusStorage`).
+- **kg/**: Storage implementations (JSON, NetworkX, Neo4j, PostgreSQL, MongoDB, Redis, Milvus, Qdrant, Faiss, Memgraph, OpenSearch, NanoVectorDB). The backend registry (`STORAGE_IMPLEMENTATIONS` / `STORAGES`) lives in `kg/__init__.py`; `kg/factory.py::get_storage_class()` resolves backend classes from configuration.
+- **llm/**: LLM and embedding provider bindings (OpenAI, Ollama, Azure, Gemini, Bedrock, Anthropic, etc.). All async with caching support.
+- **parser/**: Unified parsing layer. `parser/routing.py` resolves engine and filename hints for `legacy`, `native`, `mineru`, and `docling` flows; `parser/debug.py` provides an offline LightRAG stub for the `parser/cli.py` debug entry point (`python -m lightrag.parser.cli`). Native format parsers live as sibling sub-packages under `parser/` (currently `parser/docx/`); external HTTP-based adapters live under `parser/external/` (`mineru`, `docling`) with shared helpers in `parser/external/_common.py`, `_manifest.py`, `_zip.py`.
+- **chunker/**: Chunking strategies (token-size, recursive character, semantic vector, paragraph semantic).
+- **api/**: FastAPI service (`lightrag_server.py`) with REST endpoints and Ollama-compatible API; routers under `routers/`, static Swagger assets, packaged WebUI output, and Gunicorn launcher.
+
+## Core Architecture
+
+### LightRAG class composition
+
+`LightRAG` is assembled from focused mixins (split out of the previously monolithic `lightrag.py`):
+
+```
+LightRAG → _RoleLLMMixin → _StorageMigrationMixin → _PipelineMixin → object
+```
+
+The `@final` decorator on `LightRAG` is preserved — the mixin layering is an internal implementation detail, not an external subclassing surface. The public API (`ainsert`, `aquery`, `ainsert_custom_kg`, `initialize_storages`, etc.) is unchanged. `ainsert_custom_kg` and its internal construction logic, `_insert_done`, `_process_extract_entities`, `_refresh_addon_params_cache`, and the `addon_params` property accessors stay on `LightRAG` itself because they cut across multiple flows or depend on prompt-profile state.
+
+### Storage Layer
+
+LightRAG uses 4 storage types with pluggable backends:
+- **KV_STORAGE**: LLM response cache, text chunks, document info
+- **VECTOR_STORAGE**: Entity/relation/chunk embeddings
+- **GRAPH_STORAGE**: Entity-relation graph structure
+- **DOC_STATUS_STORAGE**: Document processing status tracking
+
+Each `LightRAG` instance can pass a `workspace` parameter for data isolation. Implementation differs per storage type:
+- **File-based**: subdirectories under `working_dir`.
+- **Collection-based**: collection name prefixes.
+- **Relational DB**: workspace column filtering.
+- **Qdrant**: payload-based partitioning.
+
+### Consistency without transactions
+
+LightRAG writes to independent stores — graph, KV, vector, doc-status — with **no transaction across them**. Every multi-store operation therefore has intermediate states, and no ordering removes them; an ordering only chooses which one it keeps.
+
+- **The rule:** an inconsistency is acceptable when it **heals itself later** (a retry, a rebuild, or the next run rewrites it) or is **harmless in direction**. Losing data is never acceptable; retaining an object that could have been deleted, or surfacing a chunk a query did not need, is.
+- A change must **improve on an accepted residue**, not swap it for its mirror. "An inconsistent state exists" is not by itself a defect report — the questions are which state, how it heals, and whether the alternative is better.
+- Every accepted residue is **written down** with its reason and recovery path, next to the code or in the relevant contract. An undocumented residue is a defect; a documented one is a decision.
+- This licenses nothing for **silent failure**. A durable write must never be reported as one that did not happen, and a failure must never be swallowed: fail loud, then let the documented residue heal.
+
+### File-backed storage contracts
+
+**Full contracts: [docs/design/NetworkXSingleWriterContract.md](docs/design/NetworkXSingleWriterContract.md) — read it before touching `lightrag/kg/networkx_impl.py` or any caller of `index_done_callback` on the graph store; [docs/design/FileBackedSnapshotContract.md](docs/design/FileBackedSnapshotContract.md) — read it before touching `lightrag/kg/nano_vector_db_impl.py`, `lightrag/kg/faiss_impl.py`, `lightrag/kg/json_kv_impl.py`, `lightrag/kg/json_doc_status_impl.py` or `lightrag/kg/file_fingerprint.py`.**
+
+Five storages keep their data in memory and publish it by rewriting a whole file, and **they do not share one model** — `JsonKVStorage` and `JsonDocStatusStorage` are the odd ones out and the contracts say so at length. Read the right one before assuming.
+
+- **All five**: a commit publishes the WHOLE namespace, so any writer's flush also publishes every other writer's pending mutation there, half-finished ones included. All five are supported for **small-scale testing and validation only**; no change to them may be justified by write throughput.
+- **`NetworkXStorage`, `NanoVectorDBStorage`, `FaissVectorDBStorage`** keep one in-memory copy per process and reconcile by reloading the file. Visibility rests on a **two-channel fence**: the file's own `(st_mtime_ns, st_size)` (authoritative, state) OR-ed with the `storage_updated` flag (accelerator, a consumable event). Both are permanent — their blind spots do not overlap.
+- Those three diverge on a write conflict, and the reason is in the contracts: the graph store **declines** the commit (it has no buffer to replay, and graph payloads are accumulate-over-read), the vector stores **reload and replay** their pending buffers and redo logs. Do not reopen reload-then-replay for the graph store without addressing the accumulate-over-read argument.
+- **`JsonKVStorage` and `JsonDocStatusStorage` use none of that.** Their data is a `Manager().dict()` every worker shares, so a mutation is visible everywhere immediately and there is nothing to reload — adding a `_get_*` entry method would be wrong. Their `storage_updated` flag means the OPPOSITE of the other three's: `True` is "dirty data still to flush", never "fresher data on disk to reload". Do not read it as a peer notification. `JsonDocStatusStorage` reimplements this protocol rather than inheriting it, so a change to one of the pair is almost always a change the other needs too; where they diverge is the flush trigger — doc-status writes that change scheduling state flush synchronously because doc-status is the pipeline's recovery anchor.
+- `NetworkXStorage` is the only storage that declares `requires_single_writer`, which is what puts the admin flows under `LightRAG._admin_write_gate`.
+
+### Pipeline concurrency contract
+
+**Full contract: [docs/design/PipelineConcurrencyContract.md](docs/design/PipelineConcurrencyContract.md) — read it before touching `lightrag/pipeline.py`, `lightrag/kg/pipeline_ingress.py`, `pipeline_status` fields, or any `/documents/*` endpoint.**
+
+- Concurrent writers coordinate through `pipeline_status` (per-workspace shared dict in `lightrag.kg.shared_storage`), mutated under `get_namespace_lock("pipeline_status", workspace=...)`.
+- `busy` alone does NOT block enqueue — enqueue + processing are allowed to run concurrently. Three states do refuse it: `destructive_busy` (clear / delete, which drops storages), `scanning_exclusive` (scan's classification phase), and `manual_freeze_requested` (a manual retry draining the pipeline to idle).
+- **Admin graph writes** (`acreate_*` / `aedit_*` / `adelete_by_*` / `amerge_entities` / `ainsert_custom_kg`) run inside `LightRAG._admin_write_gate` when the graph storage declares `requires_single_writer` (`NetworkXStorage` only): a workspace admin lock (waited for) then the `busy` reservation (`kind="admin"`, refuses on `busy` / `scanning`), in that fixed order and OUTSIDE the per-entity keyed locks. A pipeline start during the hold is deferred into the ingress mailbox and driven once on release. The routes' `check_pipeline_busy_or_raise` preflight exempts an `admin`-owned `busy` so a second REST edit reaches the admin lock and queues. Never re-acquire the admin lock inside `lightrag/utils_graph.py`.
+- The workspace **ingress mailbox** (`get_pipeline_ingress(workspace)`) is the pipeline's only wake-up channel; `doc_status` stays the source of truth, so a dropped notification is recovered by the next strict scan.
+- FAILED documents never resume automatically: they re-enter only through a sticky manual retry request (`/documents/scan`, `/documents/reprocess_failed`), granting ONE attempt each.
+- All scheduling-control-plane `doc_status` queries use `get_docs_by_statuses(..., strict=True)`; scheduler `full_docs` reads must distinguish confirmed-absent (`None`) from backend errors (raise).
+
+### Purge recovery contract
+
+**Full contract: [docs/design/PurgeRecoveryContract.md](docs/design/PurgeRecoveryContract.md) — read it before touching `_purge_kg_contributions`, `adelete_by_doc_id`, the anchor writes in `merge_nodes_and_edges`, the `kg_write_state` / `kg_purge` metadata, or the cache write ordering in `use_llm_func_with_cache`.**
+
+- "What did this document contribute?" is answerable only from the per-document write-ahead anchors (`full_entities` / `full_relations`). The reverse lookup through `text_chunks` is not a fallback — purge deletes those chunks.
+- Governing invariant: **a purge must never delete something that CARRIES attribution — a chunk row or an anchor row that names objects — and leave those objects behind.** `_purge_kg_contributions` **fails closed** (`RecoveryAnchorMissingError` → HTTP 409, nothing deleted) unless one of four proofs holds: `anchors`, `pre_graph`, `journal`, `empty_scope`.
+- **`kg_write_state` must never be inferred or backfilled** — it is written once at enqueue and is monotonic. A backfill reproduces the original silent-skip defect.
+- `kg_write_state` and `kg_purge` must stay in both `_DOC_STATUS_METADATA_CARRY_OVER_KEYS` and `_DOC_STATUS_METADATA_DIRECTIVE_KEYS` (`lightrag/utils_pipeline.py`); dropping either turns a resumable purge into a permanent refusal.
+- Chunk tracking (`entity_chunks` / `relation_chunks`) outranks graph `source_id`; code folding a `source_id` delta back into tracking must append genuine additions only.
+- LLM extraction cache rows are reachable only through the owning chunk's `llm_cache_list`, which makes that list an attribution carrier too: [LLM extraction cache reachability](docs/design/PurgeRecoveryContract.md#llm-extraction-cache-reachability) states the reference-before-row ordering, why a reference that cannot be recorded skips the cache write instead, and what the ordering does not close.
+- Merge and rename apply *Consistency without transactions* above: [the failure model](docs/design/PurgeRecoveryContract.md#merge-and-rename-failure-model) lists their ordering invariants, accepted residues and already-rejected remedies. Read it before reordering `_merge_entities_impl` or the rename branch of `_edit_entity_impl`.
+
+### Relation weight contract
+
+**Full contract: [docs/ProgramingWithCore.md](docs/ProgramingWithCore.md#relation-weight-contract)** — keep it synchronized with the core API docstrings, REST graph documentation, and custom-KG examples whenever relation write behavior changes.
+
+- `weight >= len(distinct real source IDs)` on the graph edge; a larger value is an optional importance boost. Empty IDs and the legacy placeholders `manual_creation` / `UNKNOWN` are not evidence, so a source-less relation may use any non-negative fractional weight.
+- Public ingress paths (`create_relation`, `edit_relation`, `insert_custom_kg`) must validate the complete relation **before the first storage mutation**. To go below the current evidence count, creation callers omit `source_id`, edit callers set it to an empty string in the same operation.
+- Entity merges use `max(all input weights, distinct merged real source IDs)`.
+- Legacy-row repair is **opportunistic, not a sweep**: `_merge_edges_then_upsert`'s KEEP-cap skip branch returns the stored edge without writing graph or vector record, so an undersized legacy row stays undersized until a merge, an unrelated edit, or a rebuild rewrites it.
+
+### Query Modes
+
+- **local**: Context-dependent retrieval focused on specific entities
+- **global**: Community/summary-based broad knowledge retrieval
+- **hybrid**: Combines local and global
+- **naive**: Direct vector search without graph
+- **mix**: Integrates KG and vector retrieval (recommended with reranker)
+
+## Development Commands
+
+### Setup
+```bash
+# Install with uv
+uv sync
+source .venv/bin/activate  # Or: .venv\Scripts\activate on Windows
+
+# Install with API support
+uv sync --extra api
+
+# Install specific extras
+uv sync --extra offline-storage  # Storage backends
+uv sync --extra offline-llm      # LLM providers
+uv sync --extra test             # Testing dependencies
+```
+
+### API Server
+```bash
+# Copy and configure environment
+cp env.example .env  # Edit with your LLM/embedding configs
+
+# Build WebUI
+cd lightrag_webui
+bun install --frozen-lockfile
+bun run build
+cd ..
+
+# Run server
+lightrag-server                                           # Production
+uvicorn lightrag.api.lightrag_server:app --reload        # Development
+lightrag-gunicorn                                         # Multi-worker (gunicorn)
+```
+
+### WebUI
+
+Every command below is run **from `lightrag_webui/`**, not the repository root.
+`bun test` in particular resolves `bunfig.toml` — and the preload paths inside
+it — relative to the working directory, so running it from the root silently
+loads no DOM (see *React component tests*).
+
+```bash
+cd lightrag_webui
+bun install --frozen-lockfile      # REQUIRED after any change to package.json /
+                                   # bun.lock, including a branch switch across
+                                   # one: `git checkout` does not update
+                                   # node_modules, and a stale tree surfaces as
+                                   # a wall of TS2307 "Cannot find module".
+bun run dev                        # Dev server (Node + Vite)
+bun run dev:bun                    # Dev server (Bun native)
+bun run build                      # Production build
+bun run preview                    # Preview production build
+bun run lint                       # ESLint over *.ts/tsx/js/jsx
+
+# Testing — Bun built-in runner (NOT Vitest/Jest)
+bun test                           # All tests
+bun test --watch                   # Watch mode
+bun test --coverage                # With coverage report
+bun test src/api/lightrag.test.ts  # Single test file
+bunx tsc --noEmit                  # Typecheck (`bun run build` does NOT typecheck)
+```
+
+### Testing
+
+- Use mock-based tests for external services (Redis, httpx, etc.) — do not depend on live services in unit tests.
+- Add regression tests for every bug fix.
+- **Run only the test directories that mirror the modules you changed**, and report which subset you ran plus its pass count. The suite is ~7000 tests and a full run takes over 6 minutes, which is too slow for the edit loop. Every PR's CI runs the full suite — proving nothing else broke is its job, not yours.
+- Derive the subset from the mirror layout below: `lightrag/api/config.py` → `tests/api/config/`, `lightrag/kg/redis_impl.py` → `tests/kg/redis_impl/`, `lightrag/chunker/` → `tests/chunker/`. When a change spans several modules, run each of their directories rather than widening to `tests/`.
+- Run the full suite locally only at a milestone, or when the change is genuinely cross-cutting (`lightrag/base.py`, `lightrag/utils.py`, `lightrag/kg/shared_storage.py`, or anything every backend inherits).
+- Backend tests use pytest; frontend unit tests use Bun's built-in runner — see *WebUI* above and *React component tests* below.
+- **A WebUI change runs the WHOLE frontend check set**, from `lightrag_webui/`: `bun install --frozen-lockfile` (see *WebUI* above — skip it after a branch switch and every later step fails on missing modules), then `bun test`, `bunx tsc --noEmit`, and `bun run lint`. The subsetting rule above is a backend rule and does not apply — all three together take well under a minute (test ~2 s, typecheck ~14 s, lint ~21 s), so there is nothing to save by running less. Report the pass count. `bun run build` transpiles WITHOUT checking types, so skipping `tsc --noEmit` means nothing checks them.
+
+```bash
+# Preferred for fresh shells and automation; resolves PYTHON, venv, uv, .venv, venv, python, python3
+# Default during development: only the directories mirroring the changed modules
+./scripts/test.sh tests/api/config
+./scripts/test.sh tests/kg/redis_impl
+
+# Run specific test file
+./scripts/test.sh tests/kg/test_graph_storage.py
+
+# Full suite — ~7000 tests, >6 min; milestones and cross-cutting changes only
+./scripts/test.sh tests
+
+# Run with custom workers
+./scripts/test.sh tests --test-workers 4
+```
+
+- `tests/`: main test suite, mirrors feature folders. Place new tests under the subdirectory matching the module under test:
+  - `tests/api/{auth,config,routes}/` for FastAPI server tests (auth/token, config loading, route handlers); top-level `tests/api/` for app-wide concerns (path prefixes, Ollama-compatible endpoint).
+  - `tests/chunker/`, `tests/evaluation/`, `tests/extraction/` for the like-named modules.
+  - `tests/kg/<backend>_impl/` for backend-specific storage tests, mirroring the `lightrag/kg/<backend>_impl.py` file naming. The `_impl` suffix on every subdirectory keeps the layout uniform and avoids `sys.path` shadowing on names that overlap with top-level PyPI/stdlib packages (`faiss`, `json`, `neo4j`, `networkx`, `redis`) when a test is launched directly via `python tests/kg/...`. Current backends: `faiss_impl/`, `json_impl/`, `memgraph_impl/`, `milvus_impl/`, `mongo_impl/`, `nano_impl/`, `neo4j_impl/`, `networkx_impl/`, `opensearch_impl/`, `postgres_impl/`, `qdrant_impl/`, `redis_impl/`. `tests/kg/` root holds cross-backend tests (`test_graph_storage`, `test_batch_graph_operations`, `test_unified_lock_safety`, `test_file_atomic`).
+  - `tests/llm/<provider>_impl/` for provider-specific behavior, same `_impl` convention: `bedrock_impl/`, `gemini_impl/`, `ollama_impl/`, `openai_impl/`, `voyageai_impl/`, `zhipu_impl/`. `tests/llm/` root holds cross-provider concerns (embedding, VLM, cache, role).
+  - `tests/parser/`, `tests/parser/docx/`, `tests/parser/external/{mineru,docling}/` for parser implementations.
+  - `tests/pipeline/` for ingestion pipeline and doc-status behavior (including `test_pipeline_*`, `test_doc_status_*`, `test_multimodal_*`, `test_graph_keyed_locks`).
+  - `tests/sidecar/`, `tests/setup/`, `tests/workspace/` for the like-named cross-cutting concerns.
+  - When adding a new backend or LLM provider, create a new subdirectory plus an empty `__init__.py` rather than dropping the file in the parent directory root.
+- Markers (registered in `[tool.pytest.ini_options]` in `pyproject.toml`): `offline`, `integration`, `requires_db`, `requires_api`, `pg_smoke`. Integration tests are skipped by default via `-m "not integration"`; opt in with `--run-integration`.
+- Integration env vars: `LIGHTRAG_RUN_INTEGRATION=true`, `LIGHTRAG_KEEP_ARTIFACTS=true`, `LIGHTRAG_TEST_WORKERS=4`, plus storage-specific connection strings.
+
+#### React component tests
+
+**Full guide: [docs/design/WebUITestingGuide.md](docs/design/WebUITestingGuide.md) — read it before writing or converting any test under `lightrag_webui/src/`.**
+
+- Tests are **colocated** next to the module they cover (`src/features/SiteHeader.test.ts`); the `tests/` mirror layout above is a backend rule. A test file containing JSX must be named `.test.tsx`.
+- **Run `bun test` from `lightrag_webui/`.** The `bunfig.toml` preload that installs the DOM is resolved against the CWD, and from the repository root the failure is silent — pure logic tests still pass, only component tests break.
+- **Test rendered behavior by rendering it**, through `renderWithProviders` (`src/test/render.tsx`). Do not write new tests that `readFileSync` a `.tsx` and match substrings.
+- **Never assert `toBeNull()` / `not.toBeInTheDocument()` / `toBe(element)` on a DOM node** — Bun serialises the whole happy-dom element and the run appears to HANG instead of failing. Assert a count or an extracted boolean/string instead.
+- **The DOM is process-wide**: never leave a bare `delete` of the `window` / `document` global behind; use `withoutDomGlobals()` from `src/test/domGlobals.ts`.
+- **Never import the test harness from production code** — one import from `src/` ships happy-dom to the browser.
+- **Prove the test can fail**: break the behavior it pins, see it go red, then restore.
+
+### Linting
+```bash
+ruff check .
+```
+
+## Key Implementation Patterns
+
+### LightRAG Initialization (Critical)
+
+The most common error is forgetting to initialize storages (manifests as `AttributeError: __aenter__` or `KeyError: 'history_messages'`):
+
+```python
+import asyncio
+from lightrag import LightRAG
+from lightrag.llm.openai import gpt_4o_mini_complete, openai_embed
+
+async def main():
+    rag = LightRAG(
+        working_dir="./rag_storage",
+        llm_model_func=gpt_4o_mini_complete,
+        embedding_func=openai_embed
+    )
+
+    # REQUIRED: Initialize storage backends
+    await rag.initialize_storages()
+
+    # Now safe to use
+    await rag.ainsert("Your text here")
+    result = await rag.aquery("Your question", param=QueryParam(mode="hybrid"))
+
+    # Cleanup
+    await rag.finalize_storages()
+
+asyncio.run(main())
+```
+
+### Custom Embedding Functions
+
+**Full guide: [docs/ProgramingWithCore.md](docs/ProgramingWithCore.md#custom-embedding-functions)** — the `.func` unwrapping rule, `max_token_size`, the `(len(texts), embedding_dim)` return contract that `EmbeddingFunc.__call__` enforces on every call, and the clear-the-data-directory pitfall when switching models. Read it before writing or wrapping an embedding function.
+
+### Storage Configuration
+
+Configure via environment variables or constructor params:
+
+```python
+# Environment-based (recommended for production)
+# See env.example for full list
+
+# Constructor-based
+rag = LightRAG(
+    working_dir="./storage",
+    workspace="project_name",  # For data isolation
+    kv_storage="PGKVStorage",
+    vector_storage="PGVectorStorage",
+    graph_storage="Neo4JStorage",
+    doc_status_storage="PGDocStatusStorage",
+    vector_db_storage_cls_kwargs={
+        "cosine_better_than_threshold": 0.2
+    }
+)
+```
+
+### Document Insertion
+
+```python
+# Single document
+await rag.ainsert("Text content")
+
+# Batch insertion
+await rag.ainsert(["Text 1", "Text 2", ...])
+
+# With custom IDs
+await rag.ainsert("Text", ids=["doc-123"])
+
+# With file paths (for citation)
+await rag.ainsert(["Text 1", "Text 2"], file_paths=["doc1.pdf", "doc2.pdf"])
+
+# Configure batch size
+rag = LightRAG(..., max_parallel_insert=4)  # Default: 3, max recommended: 10
+```
+
+### Query Configuration
+
+```python
+from lightrag import QueryParam
+
+result = await rag.aquery(
+    "Your question",
+    param=QueryParam(
+        mode="mix",                    # Recommended with reranker
+        top_k=60,                      # KG entities/relations to retrieve
+        chunk_top_k=20,                # Text chunks to retrieve
+        max_entity_tokens=6000,
+        max_relation_tokens=8000,
+        max_total_tokens=30000,
+        enable_rerank=True,
+        user_prompt="Additional instructions for LLM",
+        stream=False
+    )
+)
+```
+
+## Frontend Debugging via Playwright
+
+For WebUI bugs whose symptoms only surface in the rendered DOM — layout/overflow/scrollbar issues, transient flashes, third-party libraries attaching helpers to `<body>` outside React's tree, or end-to-end verification of a fix — drive the running dev server (`http://localhost:5173`) with the `document-skills:webapp-testing` skill instead of reasoning from source alone. Seed state directly via `localStorage` (persist key `settings-storage`, schema in `lightrag_webui/src/stores/settings.ts`) to skip live LLM calls. Use `wait_until="domcontentloaded"` plus a selector wait — Vite dev's long-lived polling makes `networkidle` time out.
+
+## Configuration
+
+### .env Configuration
+Primary configuration file for API server. Generate it with `make env-base` or copy `env.example` manually. Key sections:
+- Server settings (HOST, PORT, CORS)
+- Storage backends (connection strings via environment variables)
+- Query parameters (TOP_K, MAX_TOTAL_TOKENS, etc.)
+- Reranking configuration (RERANK_BINDING, RERANK_MODEL)
+- Authentication (AUTH_ACCOUNTS, LIGHTRAG_API_KEY)
+
+See `env.example` for comprehensive template.
+
+### Setup Wizard Outputs
+- Keep `.env` host-usable. Container-only hostnames and staged SSL paths belong in the wizard-managed compose layer, not persisted back into `.env`.
+- Treat `docker-compose.final.yml` as generated output assembled from `scripts/setup/templates/*.yml`.
+- For setup workflow changes, prefer `make env-*` targets over direct `scripts/setup/setup.sh` calls.
+
+## Code Style
+
+### Language
+Comments, backend code, log messages, and Git commit messages in English. Frontend uses i18next for multi-language support.
+
+### Docstrings and comments
+
+Docstrings state the **rules**: what a caller must do, what it must not do, and the gotchas it will otherwise be caught by. The **mechanism** — how it works, the accepted residues, and the alternatives already rejected — goes in `docs/design/` with a pointer from the docstring. A docstring that has grown into a design document is the thing this separates: it buries the code, and the same facts in two places drift apart.
+
+Two rules are enforced by `tests/test_docstring_budget.py` rather than by review, because both are properties of the tree rather than of any one change:
+
+- **No docstring over 80 lines** (100 for a class). The limit is generous on purpose — it catches a document, not a thorough docstring.
+- **No source line may cite a GitHub issue number.** The referent does not survive a fork, so a comment saying something is "documented in #NNNN" leaves nothing that documents it. Name the thing instead ("the two-channel fence"), or move the content into `docs/design/` and cite that. Never delete such a reference bare — migrate what it pointed at first. Enforced over `lightrag/` only: **tests may cite issue numbers**, and many do. There the number names the defect the test pins, and the test itself — its name, docstring and assertions — is the documentation, so the reference is provenance rather than the thing carrying the meaning.
+
+A third test requires every `docs/**.md` path named in the package to resolve; nothing imports those strings, so a typo is otherwise silent.
+
+### Python
+- Follow PEP 8 with 4-space indentation
+- Use type annotations
+- Prefer dataclasses for state management
+- Use `lightrag.utils.logger` instead of print
+- Async/await patterns throughout
+
+### TypeScript / React (incl. WebUI ESLint)
+- Functional components with hooks; PascalCase for components
+- 2-space indentation, single quotes (enforced by `@stylistic` rules)
+- Tailwind utility-first styling
+- ESLint stack: TypeScript-ESLint + React Hooks plugin + Prettier; `@typescript-eslint/no-explicit-any` is disabled (allowed)
+
+## Commit and Pull Request Guidance
+
+- If this repo is a fork of `HKUDS/LightRAG`. Target to `HKUDS/LightRAG` when creating PRs, not the fork's own repo.
+- PR descriptions should include: summary, motivation, linked issues if applyed, what's changed, what's broken and how it works.
+- Write commit messages (subject and body) in English. Commit messages are repository artifacts — like code comments and log messages — not conversational replies, so they follow the English code-style rule above regardless of any per-conversation working language.

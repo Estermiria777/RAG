@@ -1,0 +1,469 @@
+"""G2/G3 tests: styleKey classification and FS_base statistics."""
+
+from __future__ import annotations
+
+import pytest
+
+from lightrag.parser.docx.smart_heading.style_key import (
+    ALLOW_EMPTY_TITLE,
+    CN_CHAPTER,
+    CN_CLAUSE,
+    CN_NUM,
+    CN_PARENT_NUM,
+    EN_ALPHA,
+    EN_CHAPTER,
+    EN_CLAUSE,
+    EN_DOUBLE_PAREN,
+    EN_NUM,
+    EN_SINGLE_PAREN,
+    MULTI_LEVEL_NUM,
+    ROMAN_NUM,
+    STYLE_KEY_PRIORITY,
+    classify_numbering,
+    compute_fs_base,
+    parse_alpha_ordinal,
+    parse_cn_ordinal,
+    parse_roman,
+    reclassify_single_char_romans,
+    unit_rank,
+)
+
+pytestmark = pytest.mark.offline
+
+
+# ---------------------------------------------------------------------------
+# G2-1: positive corpus (styleKey + expected label)
+# ---------------------------------------------------------------------------
+
+POSITIVE_CASES = [
+    # CnChapter
+    ("第一章 绪论", CN_CHAPTER, "第一章"),
+    ("第 1 章 引言", CN_CHAPTER, "第 1 章"),
+    ("第一章绪论", CN_CHAPTER, "第一章"),
+    ("第一章：绪论", CN_CHAPTER, "第一章"),
+    ("第一章", CN_CHAPTER, "第一章"),  # empty title allowed
+    ("第十二篇 内容", CN_CHAPTER, "第十二篇"),
+    ("第三节 方法", CN_CHAPTER, "第三节"),
+    ("第2卷 上", CN_CHAPTER, "第2卷"),
+    ("第五编 分则", CN_CHAPTER, "第五编"),
+    ("第一部", CN_CHAPTER, "第一部"),
+    # EnChapter
+    ("Chapter 1 Introduction", EN_CHAPTER, "Chapter 1"),
+    ("chapter 2: Basics", EN_CHAPTER, "chapter 2"),
+    ("PART I", EN_CHAPTER, "PART I"),
+    ("CHAPTER 1", EN_CHAPTER, "CHAPTER 1"),
+    ("Section 3", EN_CHAPTER, "Section 3"),  # wins over EnClause
+    ("Volume II Overview", EN_CHAPTER, "Volume II"),
+    ("Part A", EN_CHAPTER, "Part A"),
+    ("Section aa", EN_CHAPTER, "Section aa"),
+    # MultiLevelNum
+    ("1.2 节", MULTI_LEVEL_NUM, "1.2"),
+    ("§ 1.1.4 节", MULTI_LEVEL_NUM, "§ 1.1.4"),
+    ("§§ 2.4.1节", MULTI_LEVEL_NUM, "§§ 2.4.1"),
+    ("1.1.2 标题", MULTI_LEVEL_NUM, "1.1.2"),
+    ("2.3、内容", MULTI_LEVEL_NUM, "2.3"),
+    ("3.4.5. Title", MULTI_LEVEL_NUM, "3.4.5"),
+    ("1.2概述", MULTI_LEVEL_NUM, "1.2"),
+    # CnClause
+    ("第十二条", CN_CLAUSE, "第十二条"),
+    ("第12条 罚则", CN_CLAUSE, "第12条"),
+    ("第 12 条 罚则", CN_CLAUSE, "第 12 条"),
+    ("第三款 内容", CN_CLAUSE, "第三款"),
+    ("第五项", CN_CLAUSE, "第五项"),
+    ("第二条规定了处罚", CN_CLAUSE, "第二条"),
+    # EnClause
+    ("Art. 2", EN_CLAUSE, "Art. 2"),
+    ("Article 12 Scope", EN_CLAUSE, "Article 12"),
+    ("Sec. 3 Rules", EN_CLAUSE, "Sec. 3"),
+    ("Clause 7", EN_CLAUSE, "Clause 7"),
+    ("§ 101", EN_CLAUSE, "§ 101"),
+    ("¶ 12 text", EN_CLAUSE, "¶ 12"),
+    # CnNum
+    ("一、项目背景", CN_NUM, "一"),
+    ("三 项目背景", CN_NUM, "三"),
+    ("十二、内容", CN_NUM, "十二"),
+    # CnParentNum
+    ("（一）总则", CN_PARENT_NUM, "（一）"),
+    ("(三）混搭括号", CN_PARENT_NUM, "(三）"),
+    ("三）半括号", CN_PARENT_NUM, "三）"),
+    ("（十二）内容", CN_PARENT_NUM, "（十二）"),
+    # RomanNum
+    ("II. Method", ROMAN_NUM, "II"),
+    ("iii、结论", ROMAN_NUM, "iii"),
+    ("Ⅲ、总则", ROMAN_NUM, "Ⅲ"),
+    ("XI. Overview", ROMAN_NUM, "XI"),
+    ("ⅻ、附录", ROMAN_NUM, "ⅻ"),
+    ("IIX. broken but harmless", ROMAN_NUM, "IIX"),
+    # EnNum
+    ("1. 概念", EN_NUM, "1"),
+    ("1.概念", EN_NUM, "1"),
+    ("1概念", EN_NUM, "1"),
+    ("12、内容", EN_NUM, "12"),
+    ("3 Title", EN_NUM, "3"),
+    # EnAlpha
+    ("A. 概念", EN_ALPHA, "A"),
+    ("a. Intro", EN_ALPHA, "a"),
+    ("B、内容", EN_ALPHA, "B"),
+    ("aa. Double", EN_ALPHA, "aa"),
+    ("zz. Double", EN_ALPHA, "zz"),
+    # EnDoubleParen
+    ("(1) 内容", EN_DOUBLE_PAREN, "(1)"),
+    ("（a）内容", EN_DOUBLE_PAREN, "（a）"),
+    ("(A) Text", EN_DOUBLE_PAREN, "(A)"),
+    ("（12）内容", EN_DOUBLE_PAREN, "（12）"),
+    ("(bb) double", EN_DOUBLE_PAREN, "(bb)"),
+    # EnSingleParen
+    ("1) 内容", EN_SINGLE_PAREN, "1"),
+    ("a) Intro", EN_SINGLE_PAREN, "a"),
+    ("12）内容", EN_SINGLE_PAREN, "12"),
+    ("zz) double", EN_SINGLE_PAREN, "zz"),
+]
+
+
+@pytest.mark.parametrize(
+    "text,style_key,label", POSITIVE_CASES, ids=[c[0] for c in POSITIVE_CASES]
+)
+def test_positive_classification(text: str, style_key: str, label: str) -> None:
+    result = classify_numbering(text)
+    assert result is not None, f"expected {style_key} for {text!r}"
+    assert result.style_key == style_key
+    assert result.label_text == label
+
+
+# ---------------------------------------------------------------------------
+# G2-1: negative corpus (must classify as body / None)
+# ---------------------------------------------------------------------------
+
+NEGATIVE_CASES = [
+    # keyword word-boundary defenses
+    "Participants met yesterday",
+    "Security is important",
+    "Articulate the plan",
+    "Chapters are numbered",
+    "Sections of society",
+    "Partition the disk",
+    "Paradigm shift",
+    # EnAlpha requires a dot/、 separator
+    "A cat sat here",
+    "I think so",
+    "A股 上涨了",
+    "B超 检查",
+    # RomanNum: separator strictness and alphabet limits
+    "XI'AN 城市",
+    "VI 编号（空格分隔）",
+    "CV. 简历缩写",
+    "MD. 医生头衔",
+    "ix regards",
+    # bare numbering with mandatory-title styleKeys → body
+    "1.2",
+    "3.14",
+    "1.2.3",
+    "三、",
+    "（一）",
+    "1)",
+    "(1)",
+    "A.",
+    "II.",
+    # 第X + non-unit char is not a chapter/clause
+    "第二天早上出发",
+    "第一时间响应",
+]
+
+
+@pytest.mark.parametrize("text", NEGATIVE_CASES, ids=NEGATIVE_CASES)
+def test_negative_classification(text: str) -> None:
+    assert classify_numbering(text) is None
+
+
+# ---------------------------------------------------------------------------
+# G2-2 / G2-3: units, ordinals, priorities
+# ---------------------------------------------------------------------------
+
+
+def test_unit_extraction_and_suborder() -> None:
+    chapter = classify_numbering("第一章 绪论")
+    section = classify_numbering("第三节 方法")
+    part = classify_numbering("第一篇 总论")
+    assert (chapter.unit, section.unit, part.unit) == ("章", "节", "篇")
+    assert unit_rank(CN_CHAPTER, "篇") < unit_rank(CN_CHAPTER, "章")
+    assert unit_rank(CN_CHAPTER, "章") < unit_rank(CN_CHAPTER, "节")
+    assert unit_rank(CN_CLAUSE, "条") < unit_rank(CN_CLAUSE, "款")
+    assert unit_rank(CN_CLAUSE, "款") < unit_rank(CN_CLAUSE, "项")
+    assert unit_rank(EN_CHAPTER, "volume") == unit_rank(EN_CHAPTER, "part")
+    assert unit_rank(EN_CHAPTER, "part") < unit_rank(EN_CHAPTER, "chapter")
+    assert unit_rank(EN_CHAPTER, "chapter") < unit_rank(EN_CHAPTER, "section")
+
+
+def test_en_clause_unit_normalization() -> None:
+    assert classify_numbering("Art. 2").unit == "article"
+    assert classify_numbering("Article 2").unit == "article"
+    assert classify_numbering("SEC. 3 Rules").unit == "section"
+    assert classify_numbering("§ 101").unit == "§"
+    assert classify_numbering("¶ 12 x").unit == "¶"
+
+
+def test_series_key_same_unit_required() -> None:
+    zh_arab = classify_numbering("第1章 引言")
+    zh_cn = classify_numbering("第一章 绪论")
+    zh_sec = classify_numbering("第一节 方法")
+    assert zh_arab.series_key() == zh_cn.series_key()  # 第1章 ≡ 第一章
+    assert zh_cn.series_key() != zh_sec.series_key()  # 章 ≠ 节
+
+
+def test_ordinals() -> None:
+    assert classify_numbering("第十二条").ordinal == 12
+    assert classify_numbering("第 12 条").ordinal == 12
+    assert classify_numbering("二十三、内容").ordinal == 23
+    assert classify_numbering("（十）内容").ordinal == 10
+    assert classify_numbering("XI. Overview").ordinal == 11
+    assert classify_numbering("Ⅲ、总则").ordinal == 3
+    assert classify_numbering("IIX. broken").ordinal is None
+    assert classify_numbering("b) Intro").ordinal == 2
+    assert classify_numbering("Chapter 4 x").ordinal == 4
+    assert classify_numbering("PART I").ordinal == 1
+    assert parse_cn_ordinal("一百二十") == 120
+    assert parse_roman("XXXIX") == 39
+
+
+def test_repeated_letter_alpha_ordinals() -> None:
+    """Word repeated-letter labels (aa, zz, aaa) parse to 27, 52, 53."""
+    assert classify_numbering("a. Intro").ordinal == 1
+    assert classify_numbering("z. Intro").ordinal == 26
+    assert classify_numbering("aa. Intro").ordinal == 27
+    assert classify_numbering("zz) Intro").ordinal == 52
+    assert classify_numbering("aaa. Intro").ordinal == 53
+    assert classify_numbering("(bb) Intro").ordinal == 28
+    assert classify_numbering("Section aa").ordinal == 27
+    assert classify_numbering("B. Beta").ordinal == 2
+    assert parse_alpha_ordinal("A") == 1
+    assert parse_alpha_ordinal("ZZ") == 52
+    assert parse_alpha_ordinal("AAA") == 53
+
+
+def test_unit_bearing_labels_honor_alpha_provenance() -> None:
+    c_sec = classify_numbering("Section ii Heading", numbering_format="lowerLetter")
+    assert c_sec is not None
+    assert c_sec.style_key == EN_CHAPTER
+    assert c_sec.unit == "section"
+    assert c_sec.ordinal == 35
+
+    c_art = classify_numbering("Article xx Heading", numbering_format="lowerLetter")
+    assert c_art is not None
+    assert c_art.style_key == EN_CLAUSE
+    assert c_art.unit == "article"
+    assert c_art.ordinal == 50
+
+    c_rom = classify_numbering("Section ii Heading")
+    assert c_rom is not None
+    assert c_rom.ordinal == 2
+
+
+def test_marker_ordinals_without_provenance_keep_alphabetic_reading() -> None:
+    """No numFmt evidence means no reinterpretation: hand-typed markers keep
+    the alphabetic reading they have always had. "(i)" stays 9 here and is
+    disambiguated downstream by reclassify_single_char_romans, not guessed."""
+    assert classify_numbering("(bb) x").ordinal == 28
+    assert classify_numbering("(i) x").ordinal == 9
+    assert classify_numbering("zz) x").ordinal == 52
+    # An explicit alpha numFmt must not be pulled into the Roman branch.
+    assert classify_numbering("(bb) x", numbering_format="lowerLetter").ordinal == 28
+    assert classify_numbering("(ii) x", numbering_format="lowerLetter").ordinal == 35
+
+
+def test_non_word_letter_runs_return_no_ordinal() -> None:
+    """Mixed or over-long alpha runs are not Word list labels."""
+    assert parse_alpha_ordinal("ab") is None
+    assert parse_alpha_ordinal("aaaab") is None
+    assert parse_alpha_ordinal("a1") is None
+    # a mixed run must not classify as EnAlpha at all (words/abbreviations)
+    assert classify_numbering("ab. Intro") is None
+    assert classify_numbering("CV. 简历缩写") is None
+    assert classify_numbering("MD. 医生头像") is None
+
+
+def _ascii_roman(n: int, *, upper: bool = False) -> str:
+    """I..XXXIX — mirrors style_key._to_roman for the classifier's domain."""
+    out: list[str] = []
+    for value, sym in ((10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")):
+        while n >= value:
+            out.append(sym)
+            n -= value
+    s = "".join(out)
+    return s if upper else s.lower()
+
+
+@pytest.mark.parametrize("num_fmt", ["lowerRoman", "upperRoman"])
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        lambda body: f"({body}) Heading",
+        lambda body: f"{body}) Heading",
+    ],
+    ids=["(%1)", "%1)"],
+)
+def test_parenthesized_roman_list_full_domain(num_fmt: str, wrap) -> None:
+    """Automatic Roman lists with paren lvlText classify every I..XXXIX item.
+
+    Without provenance-gated paren patterns, mixed runs such as (iv)/(vii)
+    fall through: _P_ROMAN requires '.'/'、' and the alphabetic backref only
+    accepts a repeated same letter.
+    """
+    upper = num_fmt == "upperRoman"
+    for n in range(1, 40):
+        body = _ascii_roman(n, upper=upper)
+        text = wrap(body)
+        cls = classify_numbering(text, numbering_format=num_fmt)
+        assert cls is not None, f"unclassified {text!r} under {num_fmt}"
+        assert cls.ordinal == n, f"{text!r}: got ordinal {cls.ordinal}, want {n}"
+        assert cls.style_key in (EN_DOUBLE_PAREN, EN_SINGLE_PAREN)
+
+
+def test_parenthesized_roman_style_keys_match_template() -> None:
+    assert (
+        classify_numbering("(iv) Heading", numbering_format="lowerRoman").style_key
+        == EN_DOUBLE_PAREN
+    )
+    assert (
+        classify_numbering("vii) Heading", numbering_format="lowerRoman").style_key
+        == EN_SINGLE_PAREN
+    )
+    assert (
+        classify_numbering("(IX) Heading", numbering_format="upperRoman").ordinal == 9
+    )
+
+
+def test_roman_provenance_out_of_domain_letters_do_not_classify() -> None:
+    """L/C/D/M are outside the I/V/X domain and the paren patterns reject them.
+
+    They satisfy the DEFAULT alphabetic backref, so before the Roman-accepting
+    patterns they classified with the alphabetic ordinal (l→12, c→3, …) — a
+    wrong ordinal, which is worse than no classification.
+    """
+    for text in ("(l) x", "(c) x", "(d) x", "(m) x", "(cc) x", "l) x"):
+        assert classify_numbering(text, numbering_format="lowerRoman") is None, text
+
+
+def test_roman_provenance_malformed_run_has_no_alphabetic_fallback() -> None:
+    """Pattern accepts, parse_roman declines: the ordinal stays None.
+
+    "vv" / "iiii" are IVX letters the pattern lets through but no Roman
+    numeral; the alphabetic reading would call them 48 / None. This is the
+    only path that reaches _parse_marker_ordinal's Roman branch with a
+    declining parse, so it is what pins the removed fallback.
+    """
+    for text in ("(vv) x", "(iiii) x", "(xxxx) x", "vv) x"):
+        cls = classify_numbering(text, numbering_format="lowerRoman")
+        assert cls is not None, text
+        assert cls.ordinal is None, f"{text!r}: invented ordinal {cls.ordinal}"
+
+
+def test_roman_provenance_mixed_case_run_does_not_classify() -> None:
+    """A rendered label is case-homogeneous; "iV" is neither list label."""
+    assert classify_numbering("(iV) x", numbering_format="lowerRoman") is None
+    assert classify_numbering("(Xi) x", numbering_format="upperRoman") is None
+
+
+def test_roman_provenance_keeps_decimal_paren_labels() -> None:
+    """The resolver renders decimal when _to_roman is out of domain.
+
+    NumberingResolver._to_roman returns str(n) for n <= 0 or n >= 4000 while
+    last_label_format still reports lowerRoman, so the Roman-accepting
+    patterns must keep the \\d+ branch or those labels lose their class.
+    """
+    for text, want in (("(0) x", 0), ("(4000) x", 4000), ("(1) x", 1)):
+        cls = classify_numbering(text, numbering_format="lowerRoman")
+        assert cls is not None, text
+        assert cls.style_key == EN_DOUBLE_PAREN
+        assert cls.ordinal == want, text
+    single = classify_numbering("1) x", numbering_format="lowerRoman")
+    assert single is not None and single.ordinal == 1
+
+
+def test_paren_roman_patterns_do_not_relax_alphabetic_negatives() -> None:
+    """Provenance gating must not widen the default alphabetic backref."""
+    assert classify_numbering("CV. 简历") is None
+    assert classify_numbering("MD. 医生") is None
+    assert classify_numbering("(iv) Heading") is None  # no Roman numFmt
+    assert classify_numbering("vii) Heading") is None
+
+
+def test_multilevel_raw_level_and_top() -> None:
+    two = classify_numbering("1.2 概述")
+    three = classify_numbering("§ 1.1.4 节")
+    assert (two.raw_level, two.top_ordinal) == (2, 1)
+    assert (three.raw_level, three.top_ordinal) == (3, 1)
+
+
+def test_priority_table() -> None:
+    assert STYLE_KEY_PRIORITY[CN_CHAPTER] == STYLE_KEY_PRIORITY[EN_CHAPTER] == 1
+    assert STYLE_KEY_PRIORITY[MULTI_LEVEL_NUM] == 2
+    assert STYLE_KEY_PRIORITY[CN_CLAUSE] == STYLE_KEY_PRIORITY[EN_CLAUSE] == 3
+    assert (
+        STYLE_KEY_PRIORITY[CN_NUM]
+        < STYLE_KEY_PRIORITY[CN_PARENT_NUM]
+        < STYLE_KEY_PRIORITY[ROMAN_NUM]
+        < STYLE_KEY_PRIORITY[EN_NUM]
+        < STYLE_KEY_PRIORITY[EN_ALPHA]
+        < STYLE_KEY_PRIORITY[EN_DOUBLE_PAREN]
+        < STYLE_KEY_PRIORITY[EN_SINGLE_PAREN]
+    )
+    assert ALLOW_EMPTY_TITLE == {CN_CHAPTER, EN_CHAPTER, CN_CLAUSE, EN_CLAUSE}
+
+
+# ---------------------------------------------------------------------------
+# G2-5: deferred single-char roman reclassification
+# ---------------------------------------------------------------------------
+
+
+def test_single_char_roman_promoted_with_companions() -> None:
+    items = [
+        classify_numbering("I. Intro"),
+        classify_numbering("II. Method"),
+        classify_numbering("III. Results"),
+    ]
+    assert items[0].style_key == EN_ALPHA  # default before the second scan
+    out = reclassify_single_char_romans(items)
+    assert [c.style_key for c in out] == [ROMAN_NUM, ROMAN_NUM, ROMAN_NUM]
+    assert out[0].ordinal == 1
+
+
+def test_single_char_roman_stays_alpha_without_companions() -> None:
+    items = [
+        classify_numbering("A. Alpha"),
+        classify_numbering("B. Beta"),
+        classify_numbering("I. Maybe roman"),
+    ]
+    out = reclassify_single_char_romans(items)
+    assert [c.style_key for c in out] == [EN_ALPHA, EN_ALPHA, EN_ALPHA]
+
+
+# ---------------------------------------------------------------------------
+# G3-1 / G3-2: FS_base
+# ---------------------------------------------------------------------------
+
+
+def test_fs_base_char_weighted_not_paragraph_count() -> None:
+    # 300 short list paragraphs at 10pt (10 chars each) vs 80 long body
+    # paragraphs at 12pt (100 chars each): weight wins, not count.
+    pairs = [(10.0, 10)] * 300 + [(12.0, 100)] * 80
+    fs = compute_fs_base(pairs)
+    assert fs.size_pt == 12.0
+    assert fs.confidence_high is True
+
+
+def test_fs_base_tie_prefers_larger() -> None:
+    fs = compute_fs_base([(10.5, 500), (12.0, 500)])
+    assert fs.size_pt == 12.0
+    assert fs.dominant_ratio == 0.5
+    assert fs.confidence_high is False
+
+
+def test_fs_base_low_confidence_below_threshold() -> None:
+    fs = compute_fs_base([(10.0, 40), (12.0, 35), (14.0, 25)])
+    assert fs.size_pt == 10.0
+    assert fs.confidence_high is False
+
+
+def test_fs_base_empty_input() -> None:
+    fs = compute_fs_base([])
+    assert fs.size_pt is None and fs.confidence_high is False
